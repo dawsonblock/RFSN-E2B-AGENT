@@ -1,0 +1,280 @@
+# SWE-bench Upstream Learning CI
+# 
+# This workflow:
+# 1. Downloads bandit DB from artifacts
+# 2. Selects prompt variant via Thompson Sampling
+# 3. Runs SWE-bench episode
+# 4. Records outcome and updates bandit
+# 5. Uploads updated bandit DB
+
+name: SWE-bench Upstream Learning
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: 'SWE-bench instance ID'
+        required: true
+        type: string
+      repo_url:
+        description: 'Repository URL to clone'
+        required: true
+        type: string
+      arm_id:
+        description: 'Specific arm to use (optional, uses bandit selection if empty)'
+        required: false
+        type: string
+        default: ''
+      provider:
+        description: 'LLM provider'
+        required: false
+        type: choice
+        options:
+          - deepseek
+          - openai
+          - anthropic
+        default: 'deepseek'
+
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  PYTHON_VERSION: '3.12'
+  BANDIT_ARTIFACT_NAME: 'rfsn-bandit-db'
+
+jobs:
+  select-arm:
+    name: Select Arm via Bandit
+    runs-on: ubuntu-latest
+    outputs:
+      arm_id: ${{ steps.select.outputs.arm_id }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Download Bandit DB
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BANDIT_ARTIFACT_NAME }}
+          path: ./artifacts
+        continue-on-error: true
+      
+      - name: Initialize Bandit DB
+        run: |
+          if [ ! -f ./artifacts/bandit.db ]; then
+            echo "Creating new bandit database..."
+            mkdir -p ./artifacts
+            python3 -c "
+from rfsn_upstream.bandit import create_bandit
+bandit = create_bandit('./artifacts/bandit.db')
+print('Arms initialized:')
+for arm in bandit.get_all_arms():
+    print(f'  - {arm.arm_id}: α={arm.alpha}, β={arm.beta}')
+"
+          fi
+      
+      - name: Select Arm
+        id: select
+        run: |
+          # Use provided arm or select via bandit
+          if [ -n "${{ github.event.inputs.arm_id }}" ]; then
+            echo "Using provided arm: ${{ github.event.inputs.arm_id }}"
+            echo "arm_id=${{ github.event.inputs.arm_id }}" >> $GITHUB_OUTPUT
+          else
+            ARM_ID=$(python3 -c "
+from rfsn_upstream.bandit import ThompsonBandit
+bandit = ThompsonBandit('./artifacts/bandit.db')
+arm = bandit.select_arm()
+print(arm)
+")
+            echo "Bandit selected arm: $ARM_ID"
+            echo "arm_id=$ARM_ID" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload Bandit DB
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BANDIT_ARTIFACT_NAME }}
+          path: ./artifacts/bandit.db
+          retention-days: 90
+
+  run-episode:
+    name: Run SWE-bench Episode
+    needs: select-arm
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Dependencies
+        run: |
+          pip install -e .
+          pip install pytest
+      
+      - name: Clone Target Repository
+        run: |
+          git clone --depth 1 ${{ github.event.inputs.repo_url || 'https://github.com/django/django.git' }} target_repo
+      
+      - name: Run Episode
+        id: episode
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python scripts/run_swebench_episode.py \
+            --instance-id "${{ github.event.inputs.instance_id || 'test_instance' }}" \
+            --repo ./target_repo \
+            --arm-id "${{ needs.select-arm.outputs.arm_id }}" \
+            --provider "${{ github.event.inputs.provider || 'deepseek' }}" \
+            --output outcome.json \
+            --verbose
+      
+      - name: Upload Outcome
+        uses: actions/upload-artifact@v4
+        with:
+          name: outcome-${{ github.event.inputs.instance_id || 'test' }}-${{ github.run_id }}
+          path: outcome.json
+          retention-days: 30
+      
+      - name: Upload Ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-${{ github.event.inputs.instance_id || 'test' }}-${{ github.run_id }}
+          path: target_repo/.rfsn_ledger/
+          retention-days: 30
+        continue-on-error: true
+
+  update-bandit:
+    name: Update Bandit with Outcome
+    needs: [select-arm, run-episode]
+    runs-on: ubuntu-latest
+    if: always()  # Run even if episode failed
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Download Bandit DB
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BANDIT_ARTIFACT_NAME }}
+          path: ./artifacts
+      
+      - name: Download Outcome
+        uses: actions/download-artifact@v4
+        with:
+          name: outcome-${{ github.event.inputs.instance_id || 'test' }}-${{ github.run_id }}
+          path: ./outcomes
+      
+      - name: Update Bandit
+        run: |
+          python3 << 'EOF'
+import json
+from pathlib import Path
+from rfsn_upstream.bandit import ThompsonBandit
+
+# Load outcome
+outcome_path = Path("./outcomes/outcome.json")
+if outcome_path.exists():
+    outcome = json.loads(outcome_path.read_text())
+    success = outcome.get("success", False)
+    arm_id = outcome.get("arm_id", "${{ needs.select-arm.outputs.arm_id }}")
+    task_id = outcome.get("instance_id", "unknown")
+    
+    # Update bandit
+    bandit = ThompsonBandit("./artifacts/bandit.db")
+    bandit.update(arm_id, success=success, task_id=task_id)
+    
+    print(f"Updated arm {arm_id}: success={success}")
+    print("\nCurrent arm stats:")
+    for arm in bandit.get_all_arms():
+        print(f"  {arm.arm_id}: rate={arm.success_rate:.2%}, pulls={arm.pulls}")
+else:
+    print("No outcome file found, skipping bandit update")
+    exit(0)
+EOF
+      
+      - name: Upload Updated Bandit DB
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BANDIT_ARTIFACT_NAME }}
+          path: ./artifacts/bandit.db
+          retention-days: 90
+          overwrite: true
+
+  report:
+    name: Generate Report
+    needs: [select-arm, run-episode, update-bandit]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Download Bandit DB
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BANDIT_ARTIFACT_NAME }}
+          path: ./artifacts
+        continue-on-error: true
+      
+      - name: Generate Summary
+        run: |
+          python3 << 'EOF'
+import os
+from pathlib import Path
+
+# Try to load bandit stats
+try:
+    from rfsn_upstream.bandit import ThompsonBandit
+    bandit = ThompsonBandit("./artifacts/bandit.db")
+    arms = bandit.get_all_arms()
+    
+    summary = """## RFSN Upstream Learning Report
+
+### Selected Arm
+- **Arm ID**: ${{ needs.select-arm.outputs.arm_id }}
+
+### Arm Statistics
+| Arm | Success Rate | Pulls | Successes | Failures |
+|-----|--------------|-------|-----------|----------|
+"""
+    for arm in sorted(arms, key=lambda a: a.success_rate, reverse=True):
+        summary += f"| {arm.arm_id} | {arm.success_rate:.1%} | {arm.pulls} | {arm.successes} | {arm.failures} |\n"
+    
+    summary += f"\n### Workflow Run\n- **Instance**: ${{ github.event.inputs.instance_id || 'test' }}\n"
+    summary += f"- **Provider**: ${{ github.event.inputs.provider || 'deepseek' }}\n"
+    summary += f"- **Run ID**: ${{ github.run_id }}\n"
+    
+except Exception as e:
+    summary = f"## RFSN Report\n\nCould not generate full report: {e}\n"
+
+with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/stdout'), 'a') as f:
+    f.write(summary)
+EOF
