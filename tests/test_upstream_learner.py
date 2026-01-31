@@ -1,259 +1,519 @@
-"""Tests for Upstream Learner components."""
+"""Tests for RFSN Upstream Learner components.
 
+Tests:
+- OutcomeDB persistence and queries
+- StrategyArm definitions and access
+- Feature extraction and fingerprinting
+- UpstreamLearner integration
+"""
+
+from __future__ import annotations
+
+import sqlite3
 import tempfile
 from pathlib import Path
+from typing import Any, List, Optional
 
 import pytest
 
-from rfsn_upstream import (
-    ThompsonBandit,
-    ArmStats,
-    Fingerprint,
-    compute_fingerprint,
-    fingerprint_from_rejection,
-    Memory,
-    MemoryIndex,
-    PROMPT_VARIANTS,
-    get_variant,
-    PromptVariant,
-)
-from rfsn_upstream.retrieval import create_memory
+
+# --- Mock classes for testing ---
+
+class MockTestResult:
+    """Mock test result for feature extraction testing."""
+    
+    def __init__(
+        self,
+        status: str = "failed",
+        stdout: str = "",
+        stderr: str = "",
+        passed: int = 0,
+        failed: int = 1,
+        errors: int = 0,
+        skipped: int = 0,
+        duration_seconds: float = 1.0,
+        failing_tests: Optional[List[str]] = None,
+    ):
+        self.status = status
+        self.stdout = stdout
+        self.stderr = stderr
+        self.passed = passed
+        self.failed = failed
+        self.errors = errors
+        self.skipped = skipped
+        self.duration_seconds = duration_seconds
+        self.failing_tests = failing_tests or []
 
 
-class TestThompsonBandit:
-    """Tests for Thompson Sampling bandit."""
-    
-    def test_bandit_initialization(self):
-        """Bandit should initialize with arms."""
-        arms = ["arm1", "arm2", "arm3"]
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bandit = ThompsonBandit(
-                db_path=Path(tmpdir) / "test.db",
-                arms=arms,
-            )
-            
-            all_arms = bandit.get_all_arms()
-            assert len(all_arms) == 3
-            
-            for arm in all_arms:
-                assert arm.arm_id in arms
-                assert arm.alpha == 1.0  # Prior
-                assert arm.beta == 1.0   # Prior
-    
-    def test_bandit_selection(self):
-        """Bandit should select arms via Thompson Sampling."""
-        arms = ["arm1", "arm2"]
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bandit = ThompsonBandit(Path(tmpdir) / "test.db", arms)
-            
-            # Select arms multiple times
-            selections = [bandit.select_arm() for _ in range(100)]
-            
-            # Both arms should be selected at least once
-            assert "arm1" in selections
-            assert "arm2" in selections
-    
-    def test_bandit_update(self):
-        """Bandit should update arm stats correctly."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bandit = ThompsonBandit(Path(tmpdir) / "test.db", ["arm1"])
-            
-            # Initial state
-            arm = bandit.get_arm_stats("arm1")
-            assert arm.alpha == 1.0
-            assert arm.beta == 1.0
-            assert arm.pulls == 0
-            
-            # Update with success
-            bandit.update("arm1", success=True)
-            arm = bandit.get_arm_stats("arm1")
-            assert arm.alpha == 2.0  # Increased
-            assert arm.beta == 1.0   # Unchanged
-            assert arm.pulls == 1
-            assert arm.successes == 1
-            
-            # Update with failure
-            bandit.update("arm1", success=False)
-            arm = bandit.get_arm_stats("arm1")
-            assert arm.alpha == 2.0  # Unchanged
-            assert arm.beta == 2.0   # Increased
-            assert arm.pulls == 2
-            assert arm.failures == 1
-    
-    def test_bandit_persistence(self):
-        """Bandit state should persist across instances."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "test.db"
-            
-            # Create and update
-            bandit1 = ThompsonBandit(db_path, ["arm1"])
-            bandit1.update("arm1", success=True)
-            bandit1.update("arm1", success=True)
-            
-            # Create new instance
-            bandit2 = ThompsonBandit(db_path)
-            arm = bandit2.get_arm_stats("arm1")
-            
-            assert arm.alpha == 3.0  # 1 prior + 2 successes
-            assert arm.successes == 2
-    
-    def test_bandit_export_import(self):
-        """Bandit state should export and import correctly."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bandit = ThompsonBandit(Path(tmpdir) / "test.db", ["a", "b"])
-            bandit.update("a", success=True)
-            bandit.update("b", success=False)
-            
-            # Export
-            state = bandit.export_state()
-            assert len(state["arms"]) == 2
-            
-            # Import to new bandit
-            new_bandit = ThompsonBandit(Path(tmpdir) / "test2.db")
-            new_bandit.import_state(state)
-            
-            arm_a = new_bandit.get_arm_stats("a")
-            assert arm_a.successes == 1
+# =============================================================================
+# OutcomeDB Tests
+# =============================================================================
 
-
-class TestFingerprinting:
-    """Tests for failure fingerprinting."""
+class TestOutcomeDB:
+    """Tests for OutcomeDB persistence."""
     
-    def test_fingerprint_deterministic(self):
-        """Fingerprints should be deterministic."""
-        fp1 = compute_fingerprint("test_failure", "NameError: name 'x' is not defined")
-        fp2 = compute_fingerprint("test_failure", "NameError: name 'x' is not defined")
+    def test_create_empty_db(self, tmp_path: Path):
+        """DB can be created fresh."""
+        from rfsn_upstream import OutcomeDB
         
-        assert fp1.fingerprint_id == fp2.fingerprint_id
-        assert fp1.category == fp2.category
+        db = OutcomeDB(tmp_path / "test.db")
+        assert db.total_episodes() == 0
     
-    def test_fingerprint_classification(self):
-        """Fingerprints should classify errors correctly."""
-        # Python errors
-        fp = compute_fingerprint("test_failure", "SyntaxError: invalid syntax")
-        assert fp.category == "syntax_error"
+    def test_add_episode(self, tmp_path: Path):
+        """Episodes can be added and retrieved."""
+        from rfsn_upstream import OutcomeDB
         
-        fp = compute_fingerprint("test_failure", "NameError: name 'foo' is not defined")
-        assert fp.category == "name_error"
+        db = OutcomeDB(tmp_path / "test.db")
         
-        # Gate rejections
-        fp = compute_fingerprint("gate_rejection", "Path '/etc/passwd' matches forbidden pattern")
-        assert fp.category == "path_violation"
-    
-    def test_fingerprint_pattern_extraction(self):
-        """Fingerprints should extract patterns."""
-        fp = compute_fingerprint(
-            "test_failure",
-            "File 'utils.py', line 42, in process\n  NameError: name 'result' is not defined"
+        episode_id = db.add_episode(
+            instance_id="django__django-12345",
+            repo_id="abc123",
+            arm_id="swe_minimal_diff",
+            success=True,
+            metrics={"steps": 5, "duration": 30.0},
+            fingerprints=[{"fingerprint_id": "fp123", "category": "test"}],
         )
         
-        patterns = fp.patterns
-        assert any("file:utils.py" in p for p in patterns)
-        assert any("line:42" in p for p in patterns)
-        assert any("name:result" in p for p in patterns)
+        assert episode_id == 1
+        assert db.total_episodes() == 1
     
-    def test_fingerprint_similarity(self):
-        """Similar fingerprints should have high similarity."""
-        fp1 = compute_fingerprint("test_failure", "NameError: name 'x' is not defined")
-        fp2 = compute_fingerprint("test_failure", "NameError: name 'y' is not defined")
-        fp3 = compute_fingerprint("test_failure", "SyntaxError: invalid syntax")
+    def test_recent_episodes(self, tmp_path: Path):
+        """Can query recent episodes."""
+        from rfsn_upstream import OutcomeDB
         
-        # Same category should be similar
-        sim12 = fp1.similarity(fp2)
-        sim13 = fp1.similarity(fp3)
+        db = OutcomeDB(tmp_path / "test.db")
         
-        assert sim12 > sim13  # Same error type more similar
-
-
-class TestMemoryRetrieval:
-    """Tests for memory storage and retrieval."""
-    
-    def test_memory_storage(self):
-        """Memories should be stored and retrieved."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            index = MemoryIndex(Path(tmpdir) / "memories.db")
-            
-            memory = create_memory(
-                memory_type="success",
-                task_id="task_001",
-                content="Fixed bug by changing return value",
+        # Add multiple episodes
+        for i in range(5):
+            db.add_episode(
+                instance_id=f"test_instance_{i}",
+                repo_id="repo123",
+                arm_id="swe_minimal_diff" if i % 2 == 0 else "swe_traceback_first",
+                success=i % 2 == 0,
+                metrics={"step": i},
+                fingerprints=[],
             )
-            
-            index.store(memory)
-            
-            retrieved = index.get(memory.memory_id)
-            assert retrieved is not None
-            assert retrieved.content == memory.content
-    
-    def test_memory_search(self):
-        """Memories should be searchable."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            index = MemoryIndex(Path(tmpdir) / "memories.db")
-            
-            index.store(create_memory("success", "t1", "Fixed NameError in parser"))
-            index.store(create_memory("failure", "t2", "Failed due to timeout"))
-            index.store(create_memory("success", "t3", "Fixed TypeError in handler"))
-            
-            # Search for specific term
-            results = index.search("parser")
-            assert len(results) >= 1
-            assert any("parser" in r.content.lower() for r in results)
-    
-    def test_memory_by_type(self):
-        """Memories should be filterable by type."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            index = MemoryIndex(Path(tmpdir) / "memories.db")
-            
-            index.store(create_memory("success", "t1", "Success 1"))
-            index.store(create_memory("success", "t2", "Success 2"))
-            index.store(create_memory("failure", "t3", "Failure 1"))
-            
-            successes = index.get_recent(k=10, memory_type="success")
-            assert len(successes) == 2
-            assert all(m.memory_type == "success" for m in successes)
-
-
-class TestPromptVariants:
-    """Tests for prompt variants."""
-    
-    def test_all_variants_exist(self):
-        """All expected variants should exist."""
-        expected = [
-            "v_minimal_fix",
-            "v_diagnose_then_patch",
-            "v_test_first",
-            "v_multi_hypothesis",
-            "v_repair_loop",
-        ]
         
-        for name in expected:
-            variant = get_variant(name)
-            assert isinstance(variant, PromptVariant)
-            assert variant.name == name
-    
-    def test_variant_has_prompts(self):
-        """Variants should have system and user prompts."""
-        for name, variant in PROMPT_VARIANTS.items():
-            assert variant.system_prompt, f"{name} missing system_prompt"
-            assert variant.user_prompt_template, f"{name} missing user_prompt_template"
-    
-    def test_variant_formatting(self):
-        """Prompt variants should format correctly."""
-        from rfsn_upstream.prompt_variants import format_prompt
+        # Query all
+        all_eps = db.recent_episodes(limit=10)
+        assert len(all_eps) == 5
         
-        variant = get_variant("v_minimal_fix")
+        # Query by success
+        success_eps = db.recent_episodes(success=True, limit=10)
+        assert len(success_eps) == 3
         
-        system, user = format_prompt(
-            variant,
-            problem_statement="Fix the bug",
-            file_content="def foo(): pass",
+        # Query by arm
+        arm_eps = db.recent_episodes(arm_id="swe_traceback_first", limit=10)
+        assert len(arm_eps) == 2
+    
+    def test_arm_success_rate(self, tmp_path: Path):
+        """Can calculate success rate per arm."""
+        from rfsn_upstream import OutcomeDB
+        
+        db = OutcomeDB(tmp_path / "test.db")
+        
+        # Add 10 episodes: 7 success, 3 failure
+        for i in range(10):
+            db.add_episode(
+                instance_id=f"test_{i}",
+                repo_id="repo",
+                arm_id="test_arm",
+                success=i < 7,
+                metrics={},
+                fingerprints=[],
+            )
+        
+        successes, total = db.arm_success_rate("test_arm")
+        assert successes == 7
+        assert total == 10
+    
+    def test_episodes_with_fingerprint(self, tmp_path: Path):
+        """Can find episodes by fingerprint."""
+        from rfsn_upstream import OutcomeDB
+        
+        db = OutcomeDB(tmp_path / "test.db")
+        
+        # Add episodes with different fingerprints
+        db.add_episode(
+            instance_id="ep1",
+            repo_id="repo",
+            arm_id="arm1",
+            success=True,
+            metrics={},
+            fingerprints=[{"fingerprint_id": "fp_shared", "category": "test"}],
+        )
+        db.add_episode(
+            instance_id="ep2",
+            repo_id="repo",
+            arm_id="arm2",
+            success=False,
+            metrics={},
+            fingerprints=[{"fingerprint_id": "fp_shared", "category": "test"}],
+        )
+        db.add_episode(
+            instance_id="ep3",
+            repo_id="repo",
+            arm_id="arm1",
+            success=True,
+            metrics={},
+            fingerprints=[{"fingerprint_id": "fp_unique", "category": "test"}],
         )
         
-        assert "Fix the bug" in user
-        assert "def foo()" in user
+        # Find by shared fingerprint
+        shared = db.episodes_with_fingerprint("fp_shared", limit=10)
+        assert len(shared) == 2
+        
+        # Find by unique fingerprint
+        unique = db.episodes_with_fingerprint("fp_unique", limit=10)
+        assert len(unique) == 1
+        assert unique[0].instance_id == "ep3"
+    
+    def test_persistence(self, tmp_path: Path):
+        """DB persists across instances."""
+        from rfsn_upstream import OutcomeDB
+        
+        db_path = tmp_path / "persist.db"
+        
+        # Create and add
+        db1 = OutcomeDB(db_path)
+        db1.add_episode(
+            instance_id="persist_test",
+            repo_id="repo",
+            arm_id="arm",
+            success=True,
+            metrics={"test": True},
+            fingerprints=[],
+        )
+        
+        # Create new instance
+        db2 = OutcomeDB(db_path)
+        episodes = db2.recent_episodes(limit=10)
+        
+        assert len(episodes) == 1
+        assert episodes[0].instance_id == "persist_test"
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# =============================================================================
+# Strategy Arm Tests
+# =============================================================================
+
+class TestStrategyArms:
+    """Tests for strategy arm definitions."""
+    
+    def test_list_arm_ids(self):
+        """All arms have unique IDs."""
+        from rfsn_upstream import list_arm_ids
+        
+        ids = list_arm_ids()
+        assert len(ids) >= 7  # At least 7 arms
+        assert len(ids) == len(set(ids))  # All unique
+    
+    def test_get_arm(self):
+        """Can retrieve arm by ID."""
+        from rfsn_upstream import get_arm, list_arm_ids
+        
+        for arm_id in list_arm_ids():
+            arm = get_arm(arm_id)
+            assert arm.arm_id == arm_id
+            assert arm.name
+            assert arm.patch_style
+            assert arm.planning_instructions
+            assert arm.max_steps > 0
+            assert arm.max_patches > 0
+    
+    def test_get_arm_invalid(self):
+        """Getting invalid arm raises ValueError."""
+        from rfsn_upstream import get_arm
+        
+        with pytest.raises(ValueError):
+            get_arm("nonexistent_arm")
+    
+    def test_swe_bench_arms_content(self):
+        """SWE-bench arms have expected content."""
+        from rfsn_upstream import SWE_BENCH_ARMS
+        
+        # Check for required arms
+        arm_names = {arm.name for arm in SWE_BENCH_ARMS}
+        assert "Minimal diff" in arm_names
+        assert "Traceback-first" in arm_names
+        
+        # Check structure
+        for arm in SWE_BENCH_ARMS:
+            assert arm.arm_id.startswith("swe_")
+            assert "\n" in arm.planning_instructions  # Multi-step
+
+
+# =============================================================================
+# Feature Extraction Tests
+# =============================================================================
+
+class TestFeatureExtraction:
+    """Tests for feature extraction and fingerprinting."""
+    
+    def test_repo_id_from_path(self):
+        """Repo ID is deterministic hash of path."""
+        from rfsn_upstream import repo_id_from_path
+        
+        # Same path = same ID
+        id1 = repo_id_from_path(Path("/foo/bar"))
+        id2 = repo_id_from_path(Path("/foo/bar"))
+        assert id1 == id2
+        
+        # Different path = different ID
+        id3 = repo_id_from_path(Path("/foo/baz"))
+        assert id1 != id3
+    
+    def test_summarize_test_failure_none(self):
+        """Summarize handles None test result."""
+        from rfsn_upstream import summarize_test_failure
+        
+        summary = summarize_test_failure(None)
+        assert summary["has_test"] is False
+    
+    def test_summarize_test_failure(self):
+        """Summarize extracts key fields from test result."""
+        from rfsn_upstream import summarize_test_failure
+        
+        test = MockTestResult(
+            status="failed",
+            stdout="FAILED test_foo::test_bar - AssertionError",
+            stderr="E   AssertionError: 1 != 2",
+            passed=5,
+            failed=1,
+            errors=0,
+            failing_tests=["test_foo::test_bar"],
+        )
+        
+        summary = summarize_test_failure(test)
+        
+        assert summary["has_test"] is True
+        assert summary["status"] == "failed"
+        assert summary["passed"] == 5
+        assert summary["failed"] == 1
+        assert "test_foo::test_bar" in summary["failing_tests"]
+    
+    def test_fingerprints_from_test_none(self):
+        """Fingerprints from None returns empty list."""
+        from rfsn_upstream import fingerprints_from_test
+        
+        fps = fingerprints_from_test(None)
+        assert fps == []
+    
+    def test_fingerprints_from_test(self):
+        """Fingerprints extracted from test failures."""
+        from rfsn_upstream import fingerprints_from_test
+        
+        test = MockTestResult(
+            stdout="FAILED - TypeError: 'NoneType' object is not subscriptable",
+            stderr="E   TypeError: 'NoneType' object is not subscriptable",
+        )
+        
+        fps = fingerprints_from_test(test)
+        
+        # Should have fingerprints
+        assert len(fps) > 0
+        
+        # Each fingerprint has required fields
+        for fp in fps:
+            assert "fingerprint_id" in fp
+            assert "category" in fp
+            assert len(fp["fingerprint_id"]) == 16  # SHA256 truncated
+    
+    def test_fingerprints_deterministic(self):
+        """Same test produces same fingerprints."""
+        from rfsn_upstream import fingerprints_from_test
+        
+        test1 = MockTestResult(
+            stdout="Error: KeyError: 'missing_key'",
+            stderr="KeyError: 'missing_key'",
+        )
+        test2 = MockTestResult(
+            stdout="Error: KeyError: 'missing_key'",
+            stderr="KeyError: 'missing_key'",
+        )
+        
+        fps1 = fingerprints_from_test(test1)
+        fps2 = fingerprints_from_test(test2)
+        
+        assert fps1 == fps2
+
+
+# =============================================================================
+# UpstreamLearner Integration Tests
+# =============================================================================
+
+class TestUpstreamLearner:
+    """Integration tests for UpstreamLearner."""
+    
+    def test_create_learner(self, tmp_path: Path):
+        """Learner can be created fresh."""
+        from rfsn_upstream import UpstreamLearner
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        assert learner.bandit is not None
+        assert learner.outcomes is not None
+    
+    def test_select_arm(self, tmp_path: Path):
+        """Learner can select an arm."""
+        from rfsn_upstream import UpstreamLearner, list_arm_ids
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        decision = learner.select(repo_path=tmp_path)
+        
+        assert decision.arm_id in list_arm_ids()
+        assert decision.arm is not None
+        assert decision.arm.arm_id == decision.arm_id
+    
+    def test_build_system_addendum(self, tmp_path: Path):
+        """System addendum includes strategy and self-critique."""
+        from rfsn_upstream import UpstreamLearner
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        decision = learner.select(repo_path=tmp_path)
+        addendum = learner.build_system_addendum(decision)
+        
+        # Check required sections
+        assert "SWE-bench Repair Strategy" in addendum
+        assert decision.arm_id in addendum
+        assert decision.arm.name in addendum
+        assert "Self-Critique Checklist" in addendum
+        assert "minimal and localized" in addendum
+    
+    def test_update_records_outcome(self, tmp_path: Path):
+        """Update records episode to both DBs."""
+        from rfsn_upstream import UpstreamLearner
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        decision = learner.select(repo_path=tmp_path)
+        
+        # Update with outcome
+        episode_id = learner.update(
+            instance_id="test_instance",
+            repo_path=tmp_path,
+            arm_id=decision.arm_id,
+            success=True,
+            metrics={"steps": 3},
+            fingerprints=[{"fingerprint_id": "test_fp", "category": "test"}],
+        )
+        
+        assert episode_id > 0
+        assert learner.outcomes.total_episodes() == 1
+    
+    def test_get_arm_stats(self, tmp_path: Path):
+        """Can get stats for all arms."""
+        from rfsn_upstream import UpstreamLearner, list_arm_ids
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        stats = learner.get_arm_stats()
+        
+        assert len(stats) == len(list_arm_ids())
+        for arm_id, s in stats.items():
+            assert "bandit_pulls" in s
+            assert "bandit_successes" in s
+            assert "db_total" in s
+    
+    def test_similar_failure_retrieval(self, tmp_path: Path):
+        """Learner finds similar past failures."""
+        from rfsn_upstream import UpstreamLearner
+        
+        learner = UpstreamLearner(
+            bandit_db=tmp_path / "bandit.db",
+            outcomes_db=tmp_path / "outcomes.db",
+        )
+        
+        # Add episode with specific fingerprint
+        learner.update(
+            instance_id="past_failure",
+            repo_path=tmp_path,
+            arm_id="swe_minimal_diff",
+            success=False,
+            metrics={},
+            fingerprints=[{"fingerprint_id": "shared_fp", "category": "type_error"}],
+        )
+        
+        # Select with same fingerprint
+        decision = learner.select(
+            repo_path=tmp_path,
+            current_fingerprints=[{"fingerprint_id": "shared_fp"}],
+        )
+        
+        # Should find similar failure
+        assert len(decision.similar_failures) > 0
+        assert decision.similar_failures[0].instance_id == "past_failure"
+
+
+# =============================================================================
+# Self-Critique Rubric Tests
+# =============================================================================
+
+class TestSelfCritiqueRubric:
+    """Tests for self-critique rubric content."""
+    
+    def test_rubric_exists(self):
+        """Rubric is importable."""
+        from rfsn_upstream import SELF_CRITIQUE_RUBRIC
+        assert SELF_CRITIQUE_RUBRIC
+    
+    def test_rubric_content(self):
+        """Rubric contains key checks."""
+        from rfsn_upstream import SELF_CRITIQUE_RUBRIC
+        
+        # Must address common issues
+        assert "minimal" in SELF_CRITIQUE_RUBRIC.lower()
+        assert "exception handling" in SELF_CRITIQUE_RUBRIC.lower()
+        assert "root cause" in SELF_CRITIQUE_RUBRIC.lower()
+    
+    def test_rubric_is_checklist(self):
+        """Rubric is formatted as a checklist."""
+        from rfsn_upstream import SELF_CRITIQUE_RUBRIC
+        
+        # Should have numbered items
+        assert "1." in SELF_CRITIQUE_RUBRIC or "1)" in SELF_CRITIQUE_RUBRIC
+
+
+# =============================================================================
+# Create Learner State Helper Tests
+# =============================================================================
+
+class TestCreateLearnerState:
+    """Tests for create_learner_state helper."""
+    
+    def test_creates_directory_and_dbs(self, tmp_path: Path):
+        """Creates directory and initializes DBs."""
+        from rfsn_upstream import create_learner_state
+        
+        new_dir = tmp_path / "new_artifacts"
+        bandit_path, outcomes_path = create_learner_state(new_dir)
+        
+        assert new_dir.exists()
+        assert Path(bandit_path).exists()
+        assert Path(outcomes_path).exists()
+    
+    def test_returns_paths(self, tmp_path: Path):
+        """Returns correct paths."""
+        from rfsn_upstream import create_learner_state
+        
+        bandit_path, outcomes_path = create_learner_state(tmp_path)
+        
+        assert bandit_path == str(tmp_path / "bandit.db")
+        assert outcomes_path == str(tmp_path / "outcomes.db")

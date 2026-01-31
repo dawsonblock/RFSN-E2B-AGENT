@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """RFSN Agent Runner - Single entrypoint for running tasks.
 
+Now with REAL upstream learning:
+- Strategy arm selection via Thompson Sampling
+- Outcome recording to persistent database
+- Self-critique rubric injection
+- Fingerprint extraction for similar failure matching
+
 Usage:
     python run_agent.py --task-id TASK_123 --workspace ./repo --task "Fix the bug"
     
-    # With specific planner
+    # With specific strategy arm
     python run_agent.py --task-id TASK_123 --workspace ./repo --task "Fix the bug" \
-        --provider deepseek --model deepseek-chat
+        --arm-id swe_minimal_diff
     
-    # With upstream learning
+    # With upstream learning (automatically selects arm)
     python run_agent.py --task-id TASK_123 --workspace ./repo --task "Fix the bug" \
-        --bandit-db bandit.db --arm-id v_minimal_fix
+        --artifacts-dir ./artifacts
 """
 
 from __future__ import annotations
@@ -18,18 +24,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from rfsn_kernel import (
-    Gate,
-    GateConfig,
-    Kernel,
     KernelConfig,
     Ledger,
     SafetyEnvelope,
@@ -52,16 +55,25 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic usage
+    # Basic usage (selects strategy via Thompson Sampling)
     python run_agent.py --task-id BUG_001 --workspace ./my_repo --task "Fix the test"
     
     # With specific LLM
     python run_agent.py --task-id BUG_001 --workspace ./my_repo --task "Fix the test" \\
         --provider openai --model gpt-4-turbo
     
-    # With bandit integration
+    # With specific strategy arm
     python run_agent.py --task-id BUG_001 --workspace ./my_repo --task "Fix the test" \\
-        --bandit-db ./bandit.db --arm-id v_minimal_fix
+        --arm-id swe_traceback_first
+    
+    # Available strategy arms:
+    #   swe_minimal_diff    - Keep patches small
+    #   swe_traceback_first - Follow the stack trace
+    #   swe_contract_fix    - Fix API/interface issues
+    #   swe_regression_guard- Add tests before fixing
+    #   swe_test_driven     - TDD approach
+    #   swe_import_fix      - Fix imports/dependencies
+    #   swe_type_fix        - Fix type errors
         """,
     )
     
@@ -106,14 +118,14 @@ Examples:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=20,
-        help="Maximum steps to run (default: 20)",
+        default=None,
+        help="Maximum steps (default: from strategy arm)",
     )
     parser.add_argument(
         "--max-patches",
         type=int,
-        default=10,
-        help="Maximum patches to apply (default: 10)",
+        default=None,
+        help="Maximum patches (default: from strategy arm)",
     )
     parser.add_argument(
         "--test-command",
@@ -123,15 +135,15 @@ Examples:
     
     # Upstream learning
     parser.add_argument(
-        "--bandit-db",
+        "--artifacts-dir",
         type=Path,
-        default=None,
-        help="Path to bandit SQLite database",
+        default=Path("./artifacts"),
+        help="Directory for learner state (default: ./artifacts)",
     )
     parser.add_argument(
         "--arm-id",
         default=None,
-        help="Specific prompt variant arm to use",
+        help="Specific strategy arm to use (optional, selects via Thompson Sampling if not provided)",
     )
     
     # Output
@@ -183,33 +195,95 @@ def main() -> int:
         logger.error(f"Workspace not found: {args.workspace}")
         return 1
     
-    # Configure LLM planner
-    model = args.model or get_model_default(args.provider)
+    # --- Initialize upstream learner ---
+    from rfsn_upstream import (
+        UpstreamLearner,
+        get_arm,
+        list_arm_ids,
+        summarize_test_failure,
+        fingerprints_from_test,
+        SELF_CRITIQUE_RUBRIC,
+    )
     
-    # Handle prompt variant from bandit
-    prompt_variant = args.arm_id
-    if args.bandit_db and not args.arm_id:
-        try:
-            from rfsn_upstream import ThompsonBandit
-            bandit = ThompsonBandit(args.bandit_db)
-            prompt_variant = bandit.select_arm()
-            logger.info(f"Bandit selected arm: {prompt_variant}")
-        except Exception as e:
-            logger.warning(f"Bandit selection failed: {e}, using default")
-            prompt_variant = "v_minimal_fix"
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    bandit_db = args.artifacts_dir / "bandit.db"
+    outcomes_db = args.artifacts_dir / "outcomes.db"
+    
+    learner = UpstreamLearner(bandit_db=bandit_db, outcomes_db=outcomes_db)
+    
+    # --- Select or honor strategy arm ---
+    decision = None
+    if args.arm_id:
+        # User provided arm - validate and use it
+        available = list_arm_ids()
+        if args.arm_id not in available:
+            logger.error(f"Unknown arm: {args.arm_id}")
+            logger.error(f"Available: {', '.join(available)}")
+            return 1
+        arm = get_arm(args.arm_id)
+        logger.info(f"Using specified arm: {args.arm_id} ({arm.name})")
+    else:
+        # Let learner select via Thompson Sampling
+        decision = learner.select(repo_path=args.workspace)
+        args.arm_id = decision.arm_id
+        arm = decision.arm
+        logger.info(f"Learner selected arm: {args.arm_id} ({arm.name})")
+    
+    # --- Build system prompt with strategy + self-critique ---
+    base_system_prompt = f"""You are an expert software engineer tasked with fixing bugs in code repositories.
+
+## Current Task
+Task ID: {args.task_id}
+Repository: {args.workspace.name}
+
+## Problem Statement
+{args.task}
+
+## Instructions
+1. Analyze the failing test or error carefully
+2. Identify the root cause
+3. Propose a minimal, targeted fix
+4. Ensure the fix doesn't break other functionality
+"""
+    
+    # Add learner addendum (strategy + self-critique rubric)
+    if decision:
+        system_addendum = learner.build_system_addendum(decision)
+    else:
+        # Build addendum manually for user-provided arm
+        system_addendum = f"""
+---
+## SWE-bench Repair Strategy
+**Active Arm**: `{arm.arm_id}` ({arm.name})
+**Patch Style**: {arm.patch_style}
+
+### Planning Steps
+{arm.planning_instructions}
+
+{SELF_CRITIQUE_RUBRIC}
+"""
+    
+    full_system_prompt = base_system_prompt + "\n" + system_addendum
+    
+    # --- Configure LLM planner ---
+    model = args.model or get_model_default(args.provider)
     
     planner_config = LLMPlannerConfig(
         provider=args.provider,
         model=model,
         temperature=args.temperature,
-        prompt_variant=prompt_variant or "v_minimal_fix",
+        max_tokens=4096,
+        system_prompt=full_system_prompt,
     )
     planner = LLMPlanner(planner_config)
     
-    # Configure kernel
+    # --- Configure kernel with arm-specific limits ---
+    max_steps = args.max_steps or arm.max_steps
+    max_patches = args.max_patches or arm.max_patches
+    
     safety_envelope = SafetyEnvelope(
-        max_steps=args.max_steps,
-        max_patches=args.max_patches,
+        max_steps=max_steps,
+        max_patches=max_patches,
     )
     
     controller_config = ControllerConfig(
@@ -219,7 +293,7 @@ def main() -> int:
     kernel_config = KernelConfig(
         controller_config=controller_config,
         safety_envelope=safety_envelope,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         verbose=args.verbose,
     )
     
@@ -230,7 +304,9 @@ def main() -> int:
     ledger_path = ledger_dir / f"{args.task_id}_{timestamp}.jsonl"
     ledger = Ledger(ledger_path)
     
-    # Run kernel
+    # --- Run kernel ---
+    logger.info(f"Running kernel: max_steps={max_steps}, max_patches={max_patches}")
+    
     try:
         result = run_kernel(
             task_id=args.task_id,
@@ -247,17 +323,35 @@ def main() -> int:
                    f"Accepted: {result.accepted_proposals}, "
                    f"Rejected: {result.rejected_proposals}")
         
-        # Update bandit if used
-        if args.bandit_db and prompt_variant:
-            try:
-                from rfsn_upstream import ThompsonBandit
-                bandit = ThompsonBandit(args.bandit_db)
-                bandit.update(prompt_variant, success=result.success, task_id=args.task_id)
-                logger.info(f"Updated bandit arm {prompt_variant}: success={result.success}")
-            except Exception as e:
-                logger.warning(f"Bandit update failed: {e}")
+        # --- Extract fingerprints from final test result ---
+        final_test = getattr(result.final_state, "last_test_result", None)
+        test_summary = summarize_test_failure(final_test)
+        fingerprints = fingerprints_from_test(final_test)
         
-        # Output result
+        # --- Build metrics ---
+        metrics: dict[str, Any] = {
+            "completion_reason": result.completion_reason,
+            "total_steps": result.total_steps,
+            "accepted_proposals": result.accepted_proposals,
+            "rejected_proposals": result.rejected_proposals,
+            "test_status": result.test_status,
+            "duration_seconds": result.duration_seconds,
+            "test_summary": test_summary,
+        }
+        
+        # --- Update upstream learner ---
+        logger.info(f"Recording outcome: success={result.success}, fingerprints={len(fingerprints)}")
+        
+        learner.update(
+            instance_id=args.task_id,
+            repo_path=args.workspace,
+            arm_id=args.arm_id,
+            success=result.success,
+            metrics=metrics,
+            fingerprints=fingerprints,
+        )
+        
+        # --- Output result ---
         outcome = {
             "task_id": args.task_id,
             "success": result.success,
@@ -268,9 +362,12 @@ def main() -> int:
             "test_status": result.test_status,
             "duration_seconds": result.duration_seconds,
             "ledger_path": str(ledger_path),
-            "arm_id": prompt_variant,
+            "arm_id": args.arm_id,
+            "arm_name": arm.name,
             "provider": args.provider,
             "model": model,
+            "fingerprint_count": len(fingerprints),
+            "artifacts_dir": str(args.artifacts_dir),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         

@@ -1,9 +1,9 @@
 # SWE-bench Upstream Learning CI
-# 
+#
 # This workflow implements REAL upstream learning:
 # 1. Downloads bandit DB + outcomes DB from artifacts
 # 2. Selects strategy arm via Thompson Sampling
-# 3. Runs SWE-bench episode with strategy + self-critique  
+# 3. Runs SWE-bench episode with strategy + self-critique
 # 4. Records outcome with fingerprints to outcomes DB
 # 5. Updates bandit posterior
 # 6. Uploads updated databases
@@ -14,36 +14,36 @@ on:
   workflow_dispatch:
     inputs:
       instance_id:
-        description: 'SWE-bench instance ID'
+        description: "SWE-bench instance ID"
         required: true
         type: string
       repo_url:
-        description: 'Repository URL to clone'
+        description: "Repository URL to clone"
         required: true
         type: string
       arm_id:
-        description: 'Specific arm to use (optional, uses bandit selection if empty)'
+        description: "Specific arm to use (optional, uses bandit selection if empty)"
         required: false
         type: string
-        default: ''
+        default: ""
       provider:
-        description: 'LLM provider'
+        description: "LLM provider"
         required: false
         type: choice
         options:
           - deepseek
           - openai
           - anthropic
-        default: 'deepseek'
+        default: "deepseek"
 
   schedule:
     # Run nightly at 2 AM UTC
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
 
 env:
-  PYTHON_VERSION: '3.11'
-  BANDIT_ARTIFACT_NAME: 'rfsn-bandit-db'
-  OUTCOMES_ARTIFACT_NAME: 'rfsn-outcomes-db'
+  PYTHON_VERSION: "3.11"
+  BANDIT_ARTIFACT_NAME: "rfsn-bandit-db"
+  OUTCOMES_ARTIFACT_NAME: "rfsn-outcomes-db"
 
 jobs:
   select-arm:
@@ -52,92 +52,82 @@ jobs:
     outputs:
       arm_id: ${{ steps.select.outputs.arm_id }}
       arm_name: ${{ steps.select.outputs.arm_name }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+
       - name: Install Package
         run: pip install -e .
-      
+
       - name: Download Bandit DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.BANDIT_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Download Outcomes DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.OUTCOMES_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Initialize Databases
         run: |
           mkdir -p ./artifacts
-          python3 << 'EOF'
-from pathlib import Path
-from rfsn_upstream import UpstreamLearner, list_arm_ids
+          python3 -c "
+          from pathlib import Path
+          from rfsn_upstream import UpstreamLearner, list_arm_ids
+          learner = UpstreamLearner(
+              bandit_db=Path('./artifacts/bandit.db'),
+              outcomes_db=Path('./artifacts/outcomes.db'),
+          )
+          print('Available strategy arms:')
+          for arm_id in list_arm_ids():
+              stats = learner.bandit.get_arm_stats(arm_id)
+              print(f'  - {arm_id}: pulls={stats.pulls}, successes={stats.successes}')
+          print(f'Total episodes in outcomes DB: {learner.outcomes.total_episodes()}')
+          "
 
-# Initialize learner (creates DBs if needed)
-learner = UpstreamLearner(
-    bandit_db=Path("./artifacts/bandit.db"),
-    outcomes_db=Path("./artifacts/outcomes.db"),
-)
-
-print("Available strategy arms:")
-for arm_id in list_arm_ids():
-    stats = learner.bandit.get_arm_stats(arm_id)
-    print(f"  - {arm_id}: pulls={stats.pulls}, successes={stats.successes}")
-
-print(f"\nTotal episodes in outcomes DB: {learner.outcomes.total_episodes()}")
-EOF
-      
       - name: Select Arm
         id: select
         run: |
           if [ -n "${{ github.event.inputs.arm_id }}" ]; then
             echo "Using provided arm: ${{ github.event.inputs.arm_id }}"
             ARM_ID="${{ github.event.inputs.arm_id }}"
-            ARM_NAME=$(python3 -c "
-from rfsn_upstream import get_arm
-arm = get_arm('$ARM_ID')
-print(arm.name)
-")
+            ARM_NAME=$(python3 -c "from rfsn_upstream import get_arm; arm = get_arm('$ARM_ID'); print(arm.name)")
           else
-            OUTPUT=$(python3 << 'EOF'
-from pathlib import Path
-from rfsn_upstream import UpstreamLearner
-
-learner = UpstreamLearner(
-    bandit_db=Path("./artifacts/bandit.db"),
-    outcomes_db=Path("./artifacts/outcomes.db"),
-)
-decision = learner.select(repo_path=Path("."))
-print(f"{decision.arm_id}|{decision.arm.name}")
-EOF
-)
+            OUTPUT=$(python3 -c "
+          from pathlib import Path
+          from rfsn_upstream import UpstreamLearner
+          learner = UpstreamLearner(
+              bandit_db=Path('./artifacts/bandit.db'),
+              outcomes_db=Path('./artifacts/outcomes.db'),
+          )
+          decision = learner.select(repo_path=Path('.'))
+          print(f'{decision.arm_id}|{decision.arm.name}')
+          ")
             ARM_ID=$(echo "$OUTPUT" | cut -d'|' -f1)
             ARM_NAME=$(echo "$OUTPUT" | cut -d'|' -f2)
             echo "Thompson Sampling selected: $ARM_ID ($ARM_NAME)"
           fi
           echo "arm_id=$ARM_ID" >> $GITHUB_OUTPUT
           echo "arm_name=$ARM_NAME" >> $GITHUB_OUTPUT
-      
+
       - name: Upload Bandit DB
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BANDIT_ARTIFACT_NAME }}
           path: ./artifacts/bandit.db
           retention-days: 90
-      
+
       - name: Upload Outcomes DB
         uses: actions/upload-artifact@v4
         with:
@@ -150,39 +140,39 @@ EOF
     needs: select-arm
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+
       - name: Install Dependencies
         run: |
           pip install -e .
           pip install pytest
-      
+
       - name: Download Bandit DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.BANDIT_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Download Outcomes DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.OUTCOMES_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Clone Target Repository
         run: |
           git clone --depth 1 ${{ github.event.inputs.repo_url || 'https://github.com/django/django.git' }} target_repo
-      
+
       - name: Run Episode
         id: episode
         env:
@@ -198,14 +188,14 @@ EOF
             --artifacts-dir ./artifacts \
             --output outcome.json \
             --verbose
-      
+
       - name: Upload Outcome
         uses: actions/upload-artifact@v4
         with:
           name: outcome-${{ github.event.inputs.instance_id || 'test' }}-${{ github.run_id }}
           path: outcome.json
           retention-days: 30
-      
+
       - name: Upload Ledger
         uses: actions/upload-artifact@v4
         with:
@@ -213,7 +203,7 @@ EOF
           path: target_repo/.rfsn_ledger/
           retention-days: 30
         continue-on-error: true
-      
+
       - name: Upload Updated DBs
         uses: actions/upload-artifact@v4
         with:
@@ -228,77 +218,67 @@ EOF
     needs: [select-arm, run-episode]
     runs-on: ubuntu-latest
     if: always()
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+
       - name: Install Package
         run: pip install -e .
-      
+
       - name: Download Episode DBs
         uses: actions/download-artifact@v4
         with:
           name: episode-dbs-${{ github.run_id }}
           path: ./artifacts
         continue-on-error: true
-      
-      - name: Fallback - Download Original DBs
-        if: failure()
-        run: |
-          echo "Episode DBs not found, using original DBs"
-      
+
       - name: Download Original Bandit DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.BANDIT_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Download Original Outcomes DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.OUTCOMES_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Show Learning Progress
         run: |
-          python3 << 'EOF'
-from pathlib import Path
-from rfsn_upstream import UpstreamLearner, list_arm_ids
+          python3 -c "
+          from pathlib import Path
+          from rfsn_upstream import UpstreamLearner, list_arm_ids
+          try:
+              learner = UpstreamLearner(
+                  bandit_db=Path('./artifacts/bandit.db'),
+                  outcomes_db=Path('./artifacts/outcomes.db'),
+              )
+              print('=== Bandit State ===')
+              for arm_id in list_arm_ids():
+                  stats = learner.bandit.get_arm_stats(arm_id)
+                  rate = stats.successes / stats.pulls if stats.pulls > 0 else 0
+                  print(f'  {arm_id}: {rate:.1%} ({stats.successes}/{stats.pulls})')
+              print(f'=== Outcomes DB ===')
+              print(f'Total episodes: {learner.outcomes.total_episodes()}')
+              recent = learner.outcomes.recent_episodes(limit=5)
+              if recent:
+                  print('Recent episodes:')
+                  for ep in recent:
+                      status = 'pass' if ep.success else 'fail'
+                      print(f'  [{status}] {ep.instance_id} | {ep.arm_id}')
+          except Exception as e:
+              print(f'Could not load learner state: {e}')
+          "
 
-try:
-    learner = UpstreamLearner(
-        bandit_db=Path("./artifacts/bandit.db"),
-        outcomes_db=Path("./artifacts/outcomes.db"),
-    )
-    
-    print("=== Bandit State ===")
-    for arm_id in list_arm_ids():
-        stats = learner.bandit.get_arm_stats(arm_id)
-        rate = stats.successes / stats.pulls if stats.pulls > 0 else 0
-        print(f"  {arm_id}: {rate:.1%} ({stats.successes}/{stats.pulls})")
-    
-    print(f"\n=== Outcomes DB ===")
-    print(f"Total episodes: {learner.outcomes.total_episodes()}")
-    
-    recent = learner.outcomes.recent_episodes(limit=5)
-    if recent:
-        print("\nRecent episodes:")
-        for ep in recent:
-            status = "✅" if ep.success else "❌"
-            print(f"  {status} {ep.instance_id} | {ep.arm_id}")
-    
-except Exception as e:
-    print(f"Could not load learner state: {e}")
-EOF
-      
       - name: Upload Updated Bandit DB
         uses: actions/upload-artifact@v4
         with:
@@ -306,7 +286,7 @@ EOF
           path: ./artifacts/bandit.db
           retention-days: 90
           overwrite: true
-      
+
       - name: Upload Updated Outcomes DB
         uses: actions/upload-artifact@v4
         with:
@@ -320,105 +300,45 @@ EOF
     needs: [select-arm, run-episode, update-databases]
     runs-on: ubuntu-latest
     if: always()
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+
       - name: Install Package
         run: pip install -e .
-      
+
       - name: Download Outcome
         uses: actions/download-artifact@v4
         with:
           name: outcome-${{ github.event.inputs.instance_id || 'test' }}-${{ github.run_id }}
           path: ./outcomes
         continue-on-error: true
-      
+
       - name: Download Bandit DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.BANDIT_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Download Outcomes DB
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.OUTCOMES_ARTIFACT_NAME }}
           path: ./artifacts
         continue-on-error: true
-      
+
       - name: Generate Summary
+        env:
+          SELECTED_ARM: ${{ needs.select-arm.outputs.arm_id }}
+          INSTANCE_ID: ${{ github.event.inputs.instance_id || 'test' }}
+          PROVIDER: ${{ github.event.inputs.provider || 'deepseek' }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          python3 << 'EOF'
-import json
-import os
-from pathlib import Path
-
-# Build summary
-summary = """## 🛡️ RFSN Upstream Learning Report
-
-### Episode Summary
-"""
-
-# Load outcome if available
-outcome_path = Path("./outcomes/outcome.json")
-if outcome_path.exists():
-    outcome = json.loads(outcome_path.read_text())
-    status = "✅ Success" if outcome.get("success") else "❌ Failed"
-    summary += f"""
-| Field | Value |
-|-------|-------|
-| Instance | `{outcome.get('instance_id', 'N/A')}` |
-| Arm | `{outcome.get('arm_id', 'N/A')}` ({outcome.get('arm_name', 'N/A')}) |
-| Status | {status} |
-| Reason | {outcome.get('completion_reason', 'N/A')} |
-| Steps | {outcome.get('total_steps', 'N/A')} |
-| Duration | {outcome.get('total_duration_seconds', 0):.1f}s |
-| Fingerprints | {outcome.get('fingerprint_count', 0)} |
-"""
-else:
-    summary += "\n*No outcome file found*\n"
-
-# Add arm statistics
-try:
-    from rfsn_upstream import UpstreamLearner, list_arm_ids
-    
-    learner = UpstreamLearner(
-        bandit_db=Path("./artifacts/bandit.db"),
-        outcomes_db=Path("./artifacts/outcomes.db"),
-    )
-    
-    summary += """
-### Strategy Arm Performance
-
-| Arm | Success Rate | Pulls | Successes |
-|-----|--------------|-------|-----------|
-"""
-    for arm_id in list_arm_ids():
-        stats = learner.bandit.get_arm_stats(arm_id)
-        rate = stats.successes / stats.pulls if stats.pulls > 0 else 0
-        summary += f"| `{arm_id}` | {rate:.1%} | {stats.pulls} | {stats.successes} |\n"
-    
-    summary += f"\n**Total Episodes Recorded**: {learner.outcomes.total_episodes()}\n"
-    
-except Exception as e:
-    summary += f"\n*Could not load learner stats: {e}*\n"
-
-summary += f"""
-### Workflow Info
-- **Run ID**: `${{ github.run_id }}`
-- **Provider**: `${{ github.event.inputs.provider || 'deepseek' }}`
-- **Selected Arm**: `${{ needs.select-arm.outputs.arm_id }}`
-"""
-
-# Write to GitHub step summary
-with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/stdout'), 'a') as f:
-    f.write(summary)
-EOF
+          python3 scripts/generate_report.py >> $GITHUB_STEP_SUMMARY
