@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """SWE-bench Episode Runner for CI/CD.
 
-Runs a single SWE-bench episode with configurable settings.
-Outputs a structured outcome.json for the CI pipeline.
+Runs a single SWE-bench episode with REAL upstream learning:
+- Strategy arm selection via Thompson Sampling
+- Outcome recording to persistent database
+- Fingerprint extraction for similar failure matching
+- Self-critique rubric injection into prompts
 
 Usage:
     python scripts/run_swebench_episode.py \
         --instance-id django__django-12345 \
         --repo /path/to/repo \
-        --arm-id v_minimal_fix \
+        --arm-id swe_minimal_diff \
         --output outcome.json
 """
 
@@ -37,12 +40,13 @@ logger = logging.getLogger("swebench_episode")
 DEFAULT_TIMEOUT = 1800  # 30 minutes
 DEFAULT_PROVIDER = "deepseek"
 DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_ARTIFACTS_DIR = "./artifacts"
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run a single SWE-bench episode",
+        description="Run a single SWE-bench episode with upstream learning",
     )
     
     parser.add_argument(
@@ -59,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--problem-statement",
         type=Path,
-        help="Path to problem statement file (optional, fetches from instance if not provided)",
+        help="Path to problem statement file (optional)",
     )
     parser.add_argument(
         "--test-command",
@@ -67,11 +71,11 @@ def parse_args() -> argparse.Namespace:
         help="Test command to run (default: auto-detect)",
     )
     
-    # Arm selection
+    # Arm selection (optional - if not provided, learner selects)
     parser.add_argument(
         "--arm-id",
-        required=True,
-        help="Prompt variant arm ID",
+        default=None,
+        help="Strategy arm ID (if not provided, Thompson Sampling selects)",
     )
     
     # LLM settings
@@ -104,6 +108,14 @@ def parse_args() -> argparse.Namespace:
         help="Docker image for execution",
     )
     
+    # Artifacts (learner state)
+    parser.add_argument(
+        "--artifacts-dir",
+        type=Path,
+        default=Path(DEFAULT_ARTIFACTS_DIR),
+        help=f"Directory for learner state (default: {DEFAULT_ARTIFACTS_DIR})",
+    )
+    
     # Output
     parser.add_argument(
         "--output",
@@ -123,9 +135,7 @@ def parse_args() -> argparse.Namespace:
 
 def get_test_command(repo_path: Path, instance_id: str) -> str:
     """Auto-detect test command based on repository structure."""
-    # Check for common test patterns
     if (repo_path / "manage.py").exists():
-        # Django project
         return "python -m pytest --tb=short -q"
     elif (repo_path / "setup.py").exists() or (repo_path / "pyproject.toml").exists():
         return "python -m pytest --tb=short -q"
@@ -137,17 +147,75 @@ def run_native(
     args: argparse.Namespace,
     problem_statement: str,
 ) -> dict:
-    """Run episode natively (without Docker)."""
+    """Run episode natively with REAL upstream learning."""
     from rfsn_kernel import run_kernel, KernelConfig, SafetyEnvelope
     from rfsn_kernel.controller import ControllerConfig
     from rfsn_kernel.llm_planner import LLMPlanner, LLMPlannerConfig
     from rfsn_kernel.ledger import Ledger
-    from rfsn_upstream import get_variant, format_prompt
+    from rfsn_upstream import (
+        UpstreamLearner,
+        get_arm,
+        list_arm_ids,
+        summarize_test_failure,
+        fingerprints_from_test,
+        repo_id_from_path,
+    )
     
-    # Get prompt variant
-    variant = get_variant(args.arm_id)
+    # --- Initialize upstream learner ---
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    bandit_db = args.artifacts_dir / "bandit.db"
+    outcomes_db = args.artifacts_dir / "outcomes.db"
     
-    # Configure planner with variant
+    learner = UpstreamLearner(bandit_db=bandit_db, outcomes_db=outcomes_db)
+    
+    # --- Select or honor arm ---
+    decision = None
+    if args.arm_id:
+        # CI provided arm - honor it
+        arm = get_arm(args.arm_id)
+        logger.info(f"Using provided arm: {args.arm_id}")
+    else:
+        # Let learner select via Thompson Sampling
+        decision = learner.select(repo_path=args.repo)
+        args.arm_id = decision.arm_id
+        arm = decision.arm
+        logger.info(f"Learner selected arm: {args.arm_id} ({arm.name})")
+    
+    # --- Build system prompt with strategy + self-critique ---
+    base_system_prompt = f"""You are an expert software engineer tasked with fixing bugs in code repositories.
+
+## Current Task
+Instance: {args.instance_id}
+Repository: {args.repo.name}
+
+## Instructions
+1. Analyze the failing test or error carefully
+2. Identify the root cause
+3. Propose a minimal, targeted fix
+4. Ensure the fix doesn't break other functionality
+"""
+    
+    # Add learner addendum (strategy + self-critique rubric)
+    if decision:
+        system_addendum = learner.build_system_addendum(decision)
+    else:
+        # Build addendum manually for CI-provided arm
+        from rfsn_upstream import SELF_CRITIQUE_RUBRIC
+        system_addendum = f"""
+---
+## SWE-bench Repair Strategy
+**Active Arm**: `{arm.arm_id}` ({arm.name})
+**Patch Style**: {arm.patch_style}
+
+### Planning Steps
+{arm.planning_instructions}
+
+{SELF_CRITIQUE_RUBRIC}
+"""
+    
+    full_system_prompt = base_system_prompt + "\n" + system_addendum
+    
+    # --- Configure planner ---
     model = args.model or (
         "deepseek-chat" if args.provider == "deepseek" else
         "gpt-4-turbo" if args.provider == "openai" else
@@ -157,19 +225,18 @@ def run_native(
     planner_config = LLMPlannerConfig(
         provider=args.provider,
         model=model,
-        temperature=variant.temperature,
-        max_tokens=variant.max_tokens,
-        system_prompt=variant.system_prompt,
+        temperature=0.2,  # Lower for more deterministic repairs
+        max_tokens=4096,
+        system_prompt=full_system_prompt,
     )
     planner = LLMPlanner(planner_config)
     
-    # Get test command
+    # --- Configure kernel with arm-specific limits ---
     test_command = args.test_command or get_test_command(args.repo, args.instance_id)
     
-    # Configure kernel
     safety_envelope = SafetyEnvelope(
-        max_steps=20,
-        max_patches=10,
+        max_steps=arm.max_steps,
+        max_patches=arm.max_patches,
     )
     
     controller_config = ControllerConfig(
@@ -183,13 +250,15 @@ def run_native(
         verbose=args.verbose,
     )
     
-    # Create ledger
+    # --- Create ledger ---
     ledger_dir = args.repo / ".rfsn_ledger"
     ledger_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     ledger = Ledger(ledger_dir / f"{args.instance_id}_{timestamp}.jsonl")
     
-    # Run kernel
+    # --- Run kernel ---
+    logger.info(f"Running kernel with max_steps={arm.max_steps}, max_patches={arm.max_patches}")
+    
     result = run_kernel(
         task_id=args.instance_id,
         task=problem_statement,
@@ -197,6 +266,37 @@ def run_native(
         planner=planner,
         config=kernel_config,
         ledger=ledger,
+    )
+    
+    # --- Extract fingerprints from final test result ---
+    final_test = getattr(result.final_state, "last_test_result", None)
+    test_summary = summarize_test_failure(final_test)
+    fingerprints = fingerprints_from_test(final_test)
+    
+    # --- Build metrics ---
+    metrics = {
+        "completion_reason": result.completion_reason,
+        "total_steps": result.total_steps,
+        "accepted_proposals": result.accepted_proposals,
+        "rejected_proposals": result.rejected_proposals,
+        "test_status": result.test_status,
+        "duration_seconds": result.duration_seconds,
+        "repo_id": repo_id_from_path(args.repo),
+        "test_summary": test_summary,
+        "arm_max_steps": arm.max_steps,
+        "arm_max_patches": arm.max_patches,
+    }
+    
+    # --- Update upstream learner with outcome ---
+    logger.info(f"Recording outcome: success={result.success}, fingerprints={len(fingerprints)}")
+    
+    learner.update(
+        instance_id=args.instance_id,
+        repo_path=args.repo,
+        arm_id=args.arm_id,
+        success=result.success,
+        metrics=metrics,
+        fingerprints=fingerprints,
     )
     
     return {
@@ -208,6 +308,8 @@ def run_native(
         "test_status": result.test_status,
         "duration_seconds": result.duration_seconds,
         "ledger_path": str(ledger.path),
+        "fingerprint_count": len(fingerprints),
+        "arm_name": arm.name,
     }
 
 
@@ -216,18 +318,17 @@ def run_docker(
     problem_statement: str,
 ) -> dict:
     """Run episode in Docker container."""
-    # Write problem statement to temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         f.write(problem_statement)
         problem_file = f.name
     
     try:
-        # Build docker command
         docker_cmd = [
             "docker", "run",
             "--rm",
             "-v", f"{args.repo}:/workspace",
             "-v", f"{problem_file}:/problem.txt",
+            "-v", f"{args.artifacts_dir.resolve()}:/artifacts",
             "-e", f"DEEPSEEK_API_KEY={os.environ.get('DEEPSEEK_API_KEY', '')}",
             "-e", f"OPENAI_API_KEY={os.environ.get('OPENAI_API_KEY', '')}",
             "-e", f"ANTHROPIC_API_KEY={os.environ.get('ANTHROPIC_API_KEY', '')}",
@@ -237,14 +338,15 @@ def run_docker(
             "--workspace", "/workspace",
             "--task", "@/problem.txt",
             "--provider", args.provider,
-            "--arm-id", args.arm_id,
+            "--artifacts-dir", "/artifacts",
             "--output", "/workspace/outcome.json",
         ]
         
+        if args.arm_id:
+            docker_cmd.extend(["--arm-id", args.arm_id])
         if args.model:
             docker_cmd.extend(["--model", args.model])
         
-        # Run with timeout
         result = subprocess.run(
             docker_cmd,
             capture_output=True,
@@ -252,7 +354,6 @@ def run_docker(
             timeout=args.timeout,
         )
         
-        # Read outcome
         outcome_path = args.repo / "outcome.json"
         if outcome_path.exists():
             return json.loads(outcome_path.read_text())
@@ -260,8 +361,8 @@ def run_docker(
             return {
                 "success": False,
                 "completion_reason": "No outcome file produced",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": result.stdout[-2000:] if result.stdout else "",
+                "stderr": result.stderr[-2000:] if result.stderr else "",
                 "return_code": result.returncode,
             }
             
@@ -282,7 +383,7 @@ def main() -> int:
         logging.getLogger().setLevel(logging.DEBUG)
     
     logger.info(f"Running SWE-bench episode: {args.instance_id}")
-    logger.info(f"Arm: {args.arm_id}, Provider: {args.provider}")
+    logger.info(f"Provider: {args.provider}, Artifacts: {args.artifacts_dir}")
     
     # Validate repo
     if not args.repo.exists():
@@ -293,7 +394,6 @@ def main() -> int:
     if args.problem_statement:
         problem_statement = args.problem_statement.read_text()
     else:
-        # Try to find in repo or use placeholder
         problem_file = args.repo / "problem_statement.txt"
         if problem_file.exists():
             problem_statement = problem_file.read_text()
@@ -327,6 +427,7 @@ def main() -> int:
         "start_time": start_time.isoformat(),
         "end_time": end_time.isoformat(),
         "total_duration_seconds": (end_time - start_time).total_seconds(),
+        "artifacts_dir": str(args.artifacts_dir),
         **result,
     }
     
@@ -337,9 +438,11 @@ def main() -> int:
     # Print summary
     print(f"\n{'='*60}")
     print(f"Instance: {args.instance_id}")
-    print(f"Arm: {args.arm_id}")
+    print(f"Arm: {args.arm_id} ({result.get('arm_name', 'N/A')})")
     print(f"Success: {result.get('success', False)}")
     print(f"Reason: {result.get('completion_reason', 'Unknown')}")
+    print(f"Steps: {result.get('total_steps', 0)}")
+    print(f"Fingerprints: {result.get('fingerprint_count', 0)}")
     print(f"Duration: {(end_time - start_time).total_seconds():.1f}s")
     print(f"{'='*60}")
     
