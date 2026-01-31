@@ -517,3 +517,27 @@ class TestCreateLearnerState:
         
         assert bandit_path == str(tmp_path / "bandit.db")
         assert outcomes_path == str(tmp_path / "outcomes.db")
+
+# =============================================================================
+# Bandit Factory Tests
+# =============================================================================
+
+class TestBanditFactory:
+    """Tests for create_bandit factory."""
+    
+    def test_create_bandit_default_arms(self, tmp_path: Path):
+        """Creates bandit with default SWE-bench arms from strategies.py."""
+        from rfsn_upstream.bandit import create_bandit
+        from rfsn_upstream.strategies import list_arm_ids
+        
+        bandit = create_bandit(db_path=tmp_path / "bandit.db")
+        
+        # Should have arms from strategies.py
+        expected_arms = set(list_arm_ids())
+        bandit_arms = {a.arm_id for a in bandit.get_all_arms()}
+        
+        # Check subset because list_arm_ids might grow, but we expect at least the standard ones
+        assert "swe_minimal_diff" in bandit_arms
+        assert "swe_traceback_first" in bandit_arms
+        # They should match exactly since create_bandit uses list_arm_ids()
+        assert bandit_arms == expected_arms

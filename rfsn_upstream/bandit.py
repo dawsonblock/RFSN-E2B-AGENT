@@ -13,7 +13,7 @@ INVARIANTS:
 
 from __future__ import annotations
 
-import json
+
 import logging
 import random
 import sqlite3
@@ -440,15 +440,16 @@ def create_bandit(
     Returns:
         Configured ThompsonBandit.
     """
-    default_arms = [
-        "v_minimal_fix",
-        "v_diagnose_then_patch",
-        "v_test_first",
-        "v_multi_hypothesis",
-        "v_repair_loop",
-    ]
+    if arms is None:
+        try:
+            from rfsn_upstream.strategies import list_arm_ids
+            arms = list_arm_ids()
+        except ImportError:
+            # Fallback if strategies not available (shouldn't happen in prod)
+            logger.warning("Could not import strategies. Using minimal default.")
+            arms = ["swe_minimal_diff"]
     
     return ThompsonBandit(
         db_path=db_path,
-        arms=arms or default_arms,
+        arms=arms,
     )

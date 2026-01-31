@@ -30,6 +30,38 @@ _FILE_LINE_RE = re.compile(
 )
 
 
+# Common error patterns for extraction & classification
+_ERROR_PATTERNS = {
+    # Python errors
+    r"SyntaxError: (.+)": ("syntax_error", "python"),
+    r"IndentationError: (.+)": ("indentation_error", "python"),
+    r"NameError: name '(\w+)' is not defined": ("name_error", "undefined"),
+    r"TypeError: (.+)": ("type_error", "python"),
+    r"AttributeError: '(\w+)' object has no attribute '(\w+)'": ("attribute_error", "missing"),
+    r"ImportError: (.+)": ("import_error", "python"),
+    r"ModuleNotFoundError: (.+)": ("import_error", "missing_module"),
+    r"ValueError: (.+)": ("value_error", "python"),
+    r"KeyError: (.+)": ("key_error", "missing_key"),
+    r"IndexError: (.+)": ("index_error", "out_of_bounds"),
+    r"AssertionError(.*)": ("assertion_error", "test"),
+    
+    # Gate rejections
+    r"Intent '.+' not in allowlist": ("intent_violation", "not_allowed"),
+    r"Path '.+' does not match allowed patterns": ("path_violation", "not_allowed"),
+    r"Path '.+' matches forbidden pattern": ("path_violation", "forbidden"),
+    r"Forbidden pattern detected": ("pattern_violation", "security"),
+    r"Max steps exceeded": ("limit_exceeded", "steps"),
+    r"Max patches exceeded": ("limit_exceeded", "patches"),
+    r"Diff too large": ("limit_exceeded", "diff_size"),
+    r"Path traversal detected": ("path_violation", "traversal"),
+    
+    # Test failures
+    r"FAILED (.+)::(.+)": ("test_failure", "assertion"),
+    r"ERROR (.+)::(.+)": ("test_failure", "error"),
+    r"pytest: error: (.+)": ("test_failure", "collection"),
+}
+
+
 def repo_id_from_path(repo_path: Path | str) -> str:
     """
     Deterministic repo identifier without requiring git metadata.
@@ -44,10 +76,6 @@ def extract_first_error(blob: str) -> str:
     m = _FIRST_ERROR_RE.search(blob)
     if m:
         return blob[m.start(): m.start() + 500].strip()
-    # Fallback: try to find exception
-    exc_match = _EXCEPTION_RE.search(blob)
-    if exc_match:
-        return exc_match.group(1).strip()
     return blob[:400].strip()
 
 
@@ -61,6 +89,20 @@ def extract_exception_type(blob: str) -> str:
             return exc_text.split(":")[0].strip()
         return exc_text.strip()
     return "unknown"
+
+
+def classify_error(text: str) -> tuple[str, str]:
+    """Classify error text into category and subcategory."""
+    for pattern, (category, subcategory) in _ERROR_PATTERNS.items():
+        if re.search(pattern, text, re.IGNORECASE):
+            return category, subcategory
+    
+    # Fallback to simple exception extraction
+    exc = extract_exception_type(text)
+    if exc != "unknown":
+        return "exception", exc.lower()
+        
+    return "unknown", "unclassified"
 
 
 def extract_failing_files(blob: str) -> list[tuple[str, int]]:
@@ -114,19 +156,23 @@ def fingerprints_from_test(test: "TestResult | None") -> list[dict[str, Any]]:
     exc_type = summary.get("exception_type", "unknown")
     first_error = summary.get("first_error_excerpt", "")
     
+    # Use advanced classification
+    category, subcategory = classify_error(first_error or exc_type)
+    
     # Create deterministic fingerprint ID
-    key = f"{exc_type}|{first_error[:200]}".encode("utf-8")
+    key = f"{category}|{subcategory}|{first_error[:200]}".encode("utf-8")
     fp_id = hashlib.sha256(key).hexdigest()[:16]
     
     fingerprints.append({
         "fingerprint_id": fp_id,
         "failure_type": "test_failure",
-        "category": exc_type.lower().replace("error", "_error").replace("exception", "_exception"),
-        "subcategory": summary.get("status", "unknown"),
+        "category": category,
+        "subcategory": subcategory,
         "patterns": [first_error[:120]],
         "context": {
             "failing_tests": summary.get("failing_tests", [])[:5],
             "failing_files": summary.get("failing_files", [])[:3],
+            "exception_type": exc_type,
         },
     })
     
@@ -155,14 +201,17 @@ def fingerprints_from_gate_rejection(
     
     This enables learning from safety violations too.
     """
-    key = f"gate:{reason}|{str(evidence)[:200]}".encode("utf-8")
+    # Use advanced classification
+    category, subcategory = classify_error(reason)
+    
+    key = f"gate:{category}|{subcategory}|{reason[:200]}".encode("utf-8")
     fp_id = hashlib.sha256(key).hexdigest()[:16]
     
     return [{
         "fingerprint_id": fp_id,
         "failure_type": "gate_rejection",
-        "category": "safety",
-        "subcategory": reason.split(":")[0] if ":" in reason else reason[:50],
+        "category": category,
+        "subcategory": subcategory,
         "patterns": [reason[:200]],
         "context": evidence,
     }]

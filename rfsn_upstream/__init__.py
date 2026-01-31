@@ -13,11 +13,6 @@ INVARIANTS:
 4. All learning happens OUTSIDE the kernel execution loop
 """
 
-from .bandit import ThompsonBandit, ArmStats
-from .fingerprint import Fingerprint, compute_fingerprint, fingerprint_from_rejection
-from .retrieval import Memory, MemoryIndex
-from .prompt_variants import PROMPT_VARIANTS, get_variant, PromptVariant
-
 # New real learner components
 from .outcome_db import OutcomeDB, EpisodeRecord
 from .strategies import SWE_BENCH_ARMS, StrategyArm, get_arm, list_arm_ids
@@ -37,35 +32,21 @@ from .upstream_learner import (
 
 __version__ = "2.0.0"
 __all__ = [
-    # Bandit
-    "ThompsonBandit",
-    "ArmStats",
-    # Fingerprinting (original)
-    "Fingerprint",
-    "compute_fingerprint",
-    "fingerprint_from_rejection",
-    # Retrieval
-    "Memory",
-    "MemoryIndex",
-    # Prompts
-    "PROMPT_VARIANTS",
-    "get_variant",
-    "PromptVariant",
-    # Outcome DB (new)
+    # Outcome DB
     "OutcomeDB",
     "EpisodeRecord",
-    # Strategies (new)
+    # Strategies
     "SWE_BENCH_ARMS",
     "StrategyArm",
     "get_arm",
     "list_arm_ids",
-    # Features (new)
+    # Features
     "repo_id_from_path",
     "summarize_test_failure",
     "fingerprints_from_test",
     "fingerprints_from_gate_rejection",
     "compute_diff_fingerprint",
-    # Upstream Learner (new)
+    # Upstream Learner
     "UpstreamLearner",
     "LearnerDecision",
     "create_learner_state",
